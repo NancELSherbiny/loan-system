@@ -17,7 +17,6 @@ export class LoanService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly jwtService: JwtService,
   ) {}
 
   async getLoan(id: string) {

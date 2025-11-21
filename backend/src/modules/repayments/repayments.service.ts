@@ -54,12 +54,22 @@ try{
           excessAmount,
         } = this.calculateBreakdown(snapshot, dto.amount, paymentDate);
 
-        this.log('info', {
-          event: 'repayment_calculation',
-          loanId: dto.loanId,
-          paymentAmount: dto.amount,
-          ...calculation,
-        });
+        // structured logging instead of local log()
+        const ctx = this.context.getContext();
+        if (ctx) {
+          this.structuredLogger.info({
+            service: 'repayment',
+            operation: ctx.operation,
+            transactionId: ctx.transactionId,
+            userId: ctx.userId,
+            metadata: {
+              event: 'repayment_calculation',
+              loanId: dto.loanId,
+              paymentAmount: dto.amount,
+              ...calculation,
+            },
+          });
+        }
 
         const totalApplied = principalPortion + interestPortion + lateFeePortion;
         const paymentStatus = totalApplied >= calculation.totalDue ? 'COMPLETED' : 'PARTIAL';
@@ -90,14 +100,23 @@ try{
           remainingExcess = this.round2(result.remainingExcess ?? 0);
           allocationSummary = result.allocationSummary ?? [];
 
-          this.log('info', {
-            event: 'repayment_excess',
-            loanId: dto.loanId,
-            excessAmount,
-            remainingExcess,
-            allocationSummary,
-            note: 'Excess payment applied to future installments',
-          });
+          const ctx2 = this.context.getContext();
+          if (ctx2) {
+            this.structuredLogger.info({
+              service: 'repayment',
+              operation: ctx2.operation,
+              transactionId: ctx2.transactionId,
+              userId: ctx2.userId,
+              metadata: {
+                event: 'repayment_excess',
+                loanId: dto.loanId,
+                excessAmount,
+                remainingExcess,
+                allocationSummary,
+                note: 'Excess payment applied to future installments',
+              },
+            });
+          }
         }
 
         // 5️⃣ Audit log
@@ -117,12 +136,21 @@ try{
           },
         });
 
-        this.log('info', {
-          event: 'repayment_persisted',
-          loanId: dto.loanId,
-          paymentId: payment.id,
-          calculation,
-        });
+        const ctx3 = this.context.getContext();
+        if (ctx3) {
+          this.structuredLogger.info({
+            service: 'repayment',
+            operation: ctx3.operation,
+            transactionId: ctx3.transactionId,
+            userId: ctx3.userId,
+            metadata: {
+              event: 'repayment_persisted',
+              loanId: dto.loanId,
+              paymentId: payment.id,
+              calculation,
+            },
+          });
+        }
 
         return {
           payment,
@@ -138,11 +166,20 @@ try{
     try {
       await this.rollbackService.rollbackTransaction(transactionId, 'Repayment failed due to error');
     } catch (rollbackErr) {
-      this.log('error', {
-        event: 'repayment_rollback_failed',
-        transactionId,
-        error: rollbackErr,
-      });
+      const ctxErr = this.context.getContext();
+      if (ctxErr) {
+        this.structuredLogger.error({
+          service: 'repayment',
+          operation: ctxErr.operation,
+          transactionId: ctxErr.transactionId,
+          userId: ctxErr.userId,
+          metadata: {
+            event: 'repayment_rollback_failed',
+            transactionId,
+            error: rollbackErr,
+          },
+        });
+      }
     }
     throw err;
   }
@@ -332,16 +369,5 @@ try{
     return Math.round(value * 100) / 100;
   }
 
-  private log(level: 'debug' | 'info' | 'warn' | 'error', metadata: Record<string, any>) {
-    const ctx = this.context.getContext();
-    if (!ctx) return;
-    this.structuredLogger.log({
-      level,
-      service: 'repayment',
-      operation: ctx.operation,
-      transactionId: ctx.transactionId,
-      userId: ctx.userId,
-      metadata,
-    });
-  }
+
 }
