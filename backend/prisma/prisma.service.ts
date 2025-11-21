@@ -2,7 +2,7 @@
 import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { PrismaClient, Prisma } from '@prisma/client';
 import { StructuredLoggerService } from '../src/common/logging/structured-logger.service';
-import { AuditContextService } from '../src/common/logging/audit-context.service';
+import { AuditContextService } from '../src/modules/audit/audit-context.service';
 
 @Injectable()
 export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
