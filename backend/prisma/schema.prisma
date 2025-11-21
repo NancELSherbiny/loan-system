@@ -1,0 +1,119 @@
+// ==========================================
+// Prisma Generator & Datasource
+// ==========================================
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==========================================
+// Models
+// ==========================================
+
+// -------- Loan --------
+model Loan {
+  id           String              @id @default(uuid())
+  borrowerId   String              @map("borrower_id")
+  amount       Decimal             @db.Decimal(15, 2)
+  interestRate Decimal             @map("interest_rate") @db.Decimal(5, 2)
+  tenor        Int
+  status       String              @db.VarChar(20)
+
+  createdAt    DateTime            @default(now()) @map("created_at")
+  updatedAt    DateTime            @updatedAt @map("updated_at")
+
+  disbursement Disbursement?
+  schedules    RepaymentSchedule[]
+  payments     Payment[]
+
+  @@index([borrowerId])
+  @@map("loans")
+}
+
+// -------- Disbursement --------
+model Disbursement {
+  id               String   @id @default(uuid())
+  loanId           String   @unique @map("loan_id")
+  amount           Decimal  @db.Decimal(15, 2)
+  disbursementDate DateTime @map("disbursement_date")
+  status           String   @db.VarChar(20)
+  rolledBackAt     DateTime? @map("rolled_back_at")
+
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  loan Loan @relation(fields: [loanId], references: [id])
+
+  @@map("disbursements")
+}
+
+// -------- Repayment Schedule --------
+model RepaymentSchedule {
+  id               String   @id @default(uuid())
+  loanId           String   @map("loan_id")
+  installmentNumber Int     @map("installment_number")
+  dueDate          DateTime @map("due_date") @db.Date
+  principalAmount  Decimal  @map("principal_amount") @db.Decimal(15, 2)
+  interestAmount   Decimal  @map("interest_amount") @db.Decimal(15, 2)
+  status           String   @db.VarChar(20)
+  paidDate         DateTime? @map("paid_date")
+
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  loan Loan @relation(fields: [loanId], references: [id])
+
+  @@map("repayment_schedules")
+}
+
+// -------- Payment --------
+model Payment {
+  id            String   @id @default(uuid())
+  loanId        String   @map("loan_id")
+  amount        Decimal  @db.Decimal(15, 2)
+  paymentDate   DateTime @map("payment_date")
+
+  principalPaid Decimal  @map("principal_paid") @db.Decimal(15, 2)
+  interestPaid  Decimal  @map("interest_paid") @db.Decimal(15, 2)
+  lateFeePaid   Decimal  @map("late_fee_paid") @db.Decimal(15, 2)
+  daysLate      Int      @map("days_late")
+
+  status        String   @db.VarChar(20)
+  rolledBackAt  DateTime? @map("rolled_back_at")
+
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  loan Loan @relation(fields: [loanId], references: [id])
+
+  @@index([loanId])
+  @@index([paymentDate])
+  @@map("payments")
+}
+
+// -------- Audit Log --------
+model AuditLog {
+  id            String   @id @default(uuid())
+  transactionId String   @map("transaction_id")
+  operation     String   @db.VarChar(50)
+  userId        String?  @map("user_id")
+  metadata      Json?
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([transactionId])
+  @@map("audit_logs")
+}
+
+// -------- Rollback Record --------
+model RollbackRecord {
+  id                  String   @id @default(uuid())
+  transactionId       String   @map("transaction_id")
+  originalOperation   String   @map("original_operation") @db.VarChar(50)
+  rollbackReason      String   @map("rollback_reason")
+  compensatingActions Json     @map("compensating_actions")
+  rolledBackBy        String?  @map("rolled_back_by")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  @@map("rollback_records")
+}
