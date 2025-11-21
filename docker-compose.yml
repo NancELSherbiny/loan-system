@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: loan_system
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+      args:
+        DATABASE_URL: postgresql://admin:password@postgres:5432/loan_system
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://admin:password@postgres:5432/loan_system
+    depends_on:
+      - postgres
+    command: sh -c "npx prisma generate && npx prisma migrate deploy && npm run start:prod"
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/usr/src/app
+    command: sh -c "npm install && npm run dev"
+
+volumes:
+  postgres_data:
