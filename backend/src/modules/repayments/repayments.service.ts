@@ -1,19 +1,17 @@
 // src/modules/repayments/repayments.service.ts
 import { Injectable, ConflictException, BadRequestException } from '@nestjs/common';
-import { Prisma, Loan, RepaymentSchedule } from '@prisma/client';
+import { Prisma, RepaymentSchedule } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { StructuredLoggerService } from '../../common/logging/structured-logger.service';
 import { CreateRepaymentDto } from './dto/create-repayement.dto';
 import { RepaymentCalculationService } from './services/repayment-calculation.service';
 import { AuditService } from '../audit/audit.service';
-import { AuditContextService } from 'src/modules/audit/audit-context.service';
+import { AuditContextService } from '../audit/audit-context.service';
 import { RollbackService } from '../rollbacks/rollback.service';
 import { LoanSnapshot, RepaymentDueSummary } from './interfaces/repayment.interface';
 import { RepaymentHistoryQueryDto } from './dto/repayment-history-query.dto';
 
 const MILLIS_PER_DAY = 1000 * 60 * 60 * 24;
-
-
 
 @Injectable()
 export class RepaymentsService {
@@ -23,29 +21,63 @@ export class RepaymentsService {
     private readonly structuredLogger: StructuredLoggerService,
     private readonly context: AuditContextService,
     private readonly calcService: RepaymentCalculationService,
-    private readonly rollbackService : RollbackService,
+    private readonly rollbackService: RollbackService,
   ) {}
 
+  /**
+   * Process a repayment with robust rollback integration.
+   *
+   * Rollback design summary:
+   * - auditService.run(...) is used as the transaction wrapper and accepts a rollback context.
+   * - If the executor throws, AuditService calls rollback.canRollback(tx) and then rollback.compensate(tx).
+   * - The compensate() provided below delegates to rollbackService.rollbackTransaction(transactionId, reason),
+   *   which performs compensating actions in its own independent transaction and persists a rollback record.
+   * - This approach ensures compensating actions survive the original (failed) transaction.
+   */
   async processRepayment(dto: CreateRepaymentDto, userId?: string) {
     if (dto.amount <= 0) throw new BadRequestException('Payment amount must be positive');
 
     const transactionId = `txn_${dto.loanId}_${Date.now()}`;
     const paymentDate = new Date(dto.paymentDate);
-    const effectiveUserId = userId ?? 'system'; // fix TypeScript issue
-try{
+    const effectiveUserId = userId ?? 'system';
+
+    // rollback context passed to AuditService
+    const rollbackContext = {
+      canRollback: async (_tx: Prisma.TransactionClient) => {
+        // Idempotent guard: only allow rollback if no rollback record exists yet
+        return this.rollbackService.canRollback(transactionId);
+      },
+
+      compensate: async (_tx: Prisma.TransactionClient) => {
+        // Perform durable compensation outside of the failing tx.
+        // rollbackTransaction persists rollbackRecord and executes compensating actions.
+        const rb = await this.rollbackService.rollbackTransaction(
+          transactionId,
+          'Automatic compensation for failed repayment',
+        );
+        return rb;
+      },
+
+      markRolledBack: async (_tx: Prisma.TransactionClient) => {
+        // No-op because rollbackTransaction already persists the rollback record.
+        return;
+      },
+    };
+
     return this.auditService.run(
       transactionId,
       'REPAYMENT',
       effectiveUserId,
       { loanId: dto.loanId, amount: dto.amount, paymentDate },
       async (tx) => {
+        // Build a consistent snapshot inside the transaction
         const snapshot = await this.buildLoanSnapshot(tx, dto.loanId, paymentDate);
 
         if (snapshot.outstandingPrincipal <= 0) {
           throw new ConflictException('Loan is already fully repaid');
         }
 
-        // 1️⃣ Calculate interest, late fee, total due
+        // Calculate allocation and breakdown
         const {
           calculation,
           principalPortion,
@@ -54,7 +86,7 @@ try{
           excessAmount,
         } = this.calculateBreakdown(snapshot, dto.amount, paymentDate);
 
-        // structured logging instead of local log()
+        // Structured logging if context present
         const ctx = this.context.getContext();
         if (ctx) {
           this.structuredLogger.info({
@@ -74,7 +106,27 @@ try{
         const totalApplied = principalPortion + interestPortion + lateFeePortion;
         const paymentStatus = totalApplied >= calculation.totalDue ? 'COMPLETED' : 'PARTIAL';
 
-        // 2️⃣ Create payment record
+        // Idempotency safety (simple heuristic): avoid creating duplicate identical payments for same loan/date/amount
+        // This is defensive — the real idempotency strategy may be stronger (idempotency keys).
+        const existingPayment = await tx.payment.findFirst({
+          where: {
+            loanId: dto.loanId,
+            paymentDate,
+            amount: dto.amount,
+          },
+        });
+        if (existingPayment) {
+          // If identical payment already exists, return it rather than creating a duplicate.
+          return {
+            payment: existingPayment,
+            calculation,
+            excessAmount: this.round2(excessAmount),
+            remainingExcess: 0,
+            allocationSummary: [],
+          };
+        }
+
+        // 1) Create payment record
         const payment = await tx.payment.create({
           data: {
             loanId: dto.loanId,
@@ -88,13 +140,12 @@ try{
           },
         });
 
-        // 3️⃣ Update current schedule
+        // 2) Update schedule (current installment)
         await this.updateSchedule(tx, snapshot.nextSchedule, paymentDate, principalPortion);
 
-        // 4️⃣ Handle overpayment
+        // 3) Handle overpayment: apply to future pending schedules
         let allocationSummary: { scheduleId: string; appliedAmount: number }[] = [];
         let remainingExcess = 0;
-
         if (excessAmount > 0) {
           const result = await this.applyOverpayment(tx, dto.loanId, paymentDate, excessAmount);
           remainingExcess = this.round2(result.remainingExcess ?? 0);
@@ -119,7 +170,7 @@ try{
           }
         }
 
-        // 5️⃣ Audit log
+        // 4) Audit log (within the transaction)
         await tx.auditLog.create({
           data: {
             transactionId,
@@ -160,30 +211,10 @@ try{
           allocationSummary,
         };
       },
+      // Provide the rollback context so AuditService.run will call it if the executor throws.
+      { rollback: rollbackContext },
     );
-  } catch(err) {
-    // Automatic rollback on failure
-    try {
-      await this.rollbackService.rollbackTransaction(transactionId, 'Repayment failed due to error');
-    } catch (rollbackErr) {
-      const ctxErr = this.context.getContext();
-      if (ctxErr) {
-        this.structuredLogger.error({
-          service: 'repayment',
-          operation: ctxErr.operation,
-          transactionId: ctxErr.transactionId,
-          userId: ctxErr.userId,
-          metadata: {
-            event: 'repayment_rollback_failed',
-            transactionId,
-            error: rollbackErr,
-          },
-        });
-      }
-    }
-    throw err;
   }
-}
 
   // Apply overpayment to future schedules
   private async applyOverpayment(
@@ -228,26 +259,54 @@ try{
     return { remainingExcess, allocationSummary };
   }
 
-  async getRepaymentHistory( loanId: string, query?: RepaymentHistoryQueryDto, ) 
-  { const where: Prisma.PaymentWhereInput = { loanId }; 
-  if (query?.from || query?.to) { where.paymentDate = {}; 
-  if (query.from) where.paymentDate.gte = new Date(query.from); 
-  if (query.to) where.paymentDate.lte = new Date(query.to); } 
-  return this.prisma.payment.findMany({ where, orderBy: { paymentDate: 'asc' }, }); } 
-  
-  async getRepaymentSchedule(loanId: string) 
-  { return this.prisma.repaymentSchedule.findMany({ where: { loanId }, 
-    orderBy: { installmentNumber: 'asc' }, }); } 
-    
-  async calculateCurrentDue( loanId: string, asOfDate: Date = new Date(), ): Promise<RepaymentDueSummary> { 
-    const snapshot = await this.buildLoanSnapshot(this.prisma, loanId, asOfDate); 
-    const interestRate = this.toNumber(snapshot.loan.interestRate); 
-    // Calculate interest day-by-day, accounting for principal reductions from payments 
-    const accruedInterest = this.calcService.calculateDailyInterestWithPrincipalReductions( snapshot.principalAtStartOfPeriod, interestRate, snapshot.lastPaymentDate, asOfDate, snapshot.paymentsInPeriod, this.isLeapYear(asOfDate.getFullYear()), ); 
-    const dueDate = snapshot.nextSchedule?.dueDate ? new Date(snapshot.nextSchedule.dueDate) : this.addMonths(snapshot.lastPaymentDate, 1); const daysLate = Math.max(this.diffInDays(asOfDate, dueDate) - 3, 0); // 3-day grace 
-    const lateFee = this.calcService.calculateLateFee(daysLate); const scheduledPrincipal = snapshot.nextSchedule ? this.toNumber(snapshot.nextSchedule.principalAmount) : snapshot.outstandingPrincipal; 
-    const totalDue = this.round2( accruedInterest + lateFee + Math.min(scheduledPrincipal, snapshot.outstandingPrincipal), ); 
-    return { outstandingPrincipal: this.round2(snapshot.outstandingPrincipal), accruedInterest: this.round2(accruedInterest), lateFee, totalDue, daysLate, nextDueDate: dueDate, nextInstallmentNumber: snapshot.nextSchedule?.installmentNumber ?? null, scheduledPrincipal: this.round2(Math.min(scheduledPrincipal, snapshot.outstandingPrincipal)), }; }
+  async getRepaymentHistory(loanId: string, query?: RepaymentHistoryQueryDto) {
+    const where: Prisma.PaymentWhereInput = { loanId };
+    if (query?.from || query?.to) {
+      where.paymentDate = {};
+      if (query.from) where.paymentDate.gte = new Date(query.from);
+      if (query.to) where.paymentDate.lte = new Date(query.to);
+    }
+    return this.prisma.payment.findMany({ where, orderBy: { paymentDate: 'asc' } });
+  }
+
+  async getRepaymentSchedule(loanId: string) {
+    return this.prisma.repaymentSchedule.findMany({
+      where: { loanId },
+      orderBy: { installmentNumber: 'asc' },
+    });
+  }
+
+  async calculateCurrentDue(loanId: string, asOfDate: Date = new Date()): Promise<RepaymentDueSummary> {
+    const snapshot = await this.buildLoanSnapshot(this.prisma, loanId, asOfDate);
+    const interestRate = this.toNumber(snapshot.loan.interestRate);
+
+    const accruedInterest = this.calcService.calculateDailyInterestWithPrincipalReductions(
+      snapshot.principalAtStartOfPeriod,
+      interestRate,
+      snapshot.lastPaymentDate,
+      asOfDate,
+      snapshot.paymentsInPeriod,
+      this.isLeapYear(asOfDate.getFullYear()),
+    );
+
+    const dueDate = snapshot.nextSchedule?.dueDate ? new Date(snapshot.nextSchedule.dueDate) : this.addMonths(snapshot.lastPaymentDate, 1);
+    const daysLate = Math.max(this.diffInDays(asOfDate, dueDate) - 3, 0); // 3-day grace
+    const lateFee = this.calcService.calculateLateFee(daysLate);
+    const scheduledPrincipal = snapshot.nextSchedule ? this.toNumber(snapshot.nextSchedule.principalAmount) : snapshot.outstandingPrincipal;
+
+    const totalDue = this.round2(accruedInterest + lateFee + Math.min(scheduledPrincipal, snapshot.outstandingPrincipal));
+
+    return {
+      outstandingPrincipal: this.round2(snapshot.outstandingPrincipal),
+      accruedInterest: this.round2(accruedInterest),
+      lateFee,
+      totalDue,
+      daysLate,
+      nextDueDate: dueDate,
+      nextInstallmentNumber: snapshot.nextSchedule?.installmentNumber ?? null,
+      scheduledPrincipal: this.round2(Math.min(scheduledPrincipal, snapshot.outstandingPrincipal)),
+    };
+  }
 
   // --- Helper methods for calculation, snapshot, schedule update ---
   private async buildLoanSnapshot(
@@ -368,6 +427,4 @@ try{
   private round2(value: number) {
     return Math.round(value * 100) / 100;
   }
-
-
 }

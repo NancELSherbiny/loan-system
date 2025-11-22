@@ -18,7 +18,6 @@ export class RepaymentCalculationService {
     isLeapYear = false,
   ): number {
     if (principal <= 0 || days <= 0) return 0;
-    if (annualRate < 0) throw new Error('Annual rate cannot be negative');
 
     const divisor = isLeapYear ? 366 : 365;
     const dailyRate = annualRate / 100 / divisor;
@@ -26,8 +25,7 @@ export class RepaymentCalculationService {
   }
 
   /**
-   * Calculate interest day-by-day, accounting for principal reductions from payments.
-   * This ensures interest accrues daily based on the outstanding principal at the start of each day.
+   * Corrected: Payments are applied at the START of the day BEFORE interest accrues.
    */
   calculateDailyInterestWithPrincipalReductions(
     startPrincipal: number,
@@ -50,6 +48,7 @@ export class RepaymentCalculationService {
 
     let currentPrincipal = startPrincipal;
     let totalInterest = 0;
+
     let currentDate = new Date(startDate);
     currentDate.setHours(0, 0, 0, 0);
 
@@ -58,24 +57,22 @@ export class RepaymentCalculationService {
 
     let paymentIndex = 0;
 
-    // Calculate interest day by day
-    while (currentDate <= endDateNormalized) {
-      // Calculate interest for this day based on principal at start of day
-      const dailyInterest = this.round2(currentPrincipal * dailyRate);
-      totalInterest += dailyInterest;
-
-      // Apply all payments made on this day (there could be multiple)
+    while (currentDate < endDateNormalized) {
+      // 1. Apply any payments for this day BEFORE interest accrues
       while (
         paymentIndex < sortedPayments.length &&
         this.isSameDay(sortedPayments[paymentIndex].paymentDate, currentDate)
       ) {
-        // Apply principal reduction from payment
         currentPrincipal = Math.max(
           0,
           currentPrincipal - sortedPayments[paymentIndex].principalPaid,
         );
         paymentIndex++;
       }
+
+      // 2. Calculate interest using the updated principal
+      const dailyInterest = currentPrincipal * dailyRate;
+      totalInterest += dailyInterest;
 
       // Move to next day
       currentDate.setDate(currentDate.getDate() + 1);
@@ -85,9 +82,10 @@ export class RepaymentCalculationService {
   }
 
   calculateLateFee(daysLate: number, gracePeriod = 3): number {
-    const effectiveDaysLate = Math.max(0, daysLate - gracePeriod);
-    if (effectiveDaysLate === 0) return 0;
-    if (effectiveDaysLate >= 30) return this.escalatedLateFee;
+    const effective = Math.max(0, daysLate - gracePeriod);
+    if (effective === 0) return 0;
+
+    if (daysLate >= 30) return this.escalatedLateFee;
     return this.baseLateFee;
   }
 
@@ -98,6 +96,7 @@ export class RepaymentCalculationService {
     outstandingPrincipal: number,
   ): PaymentAllocation {
     let remaining = paymentAmount;
+
     const interestPaid = Math.min(interestDue, remaining);
     remaining -= interestPaid;
 
@@ -120,9 +119,10 @@ export class RepaymentCalculationService {
   private isSameDay(date1: Date, date2: Date): boolean {
     const d1 = new Date(date1);
     d1.setHours(0, 0, 0, 0);
+
     const d2 = new Date(date2);
     d2.setHours(0, 0, 0, 0);
+
     return d1.getTime() === d2.getTime();
   }
 }
-

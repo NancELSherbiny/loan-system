@@ -10,7 +10,7 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { CreateDisbursementDto } from './dto/create-disbursement.dto';
 import { AuditService } from '../audit/audit.service';
-import { StructuredLoggerService } from 'src/common/logging/structured-logger.service';
+import { StructuredLoggerService } from '../../common/logging/structured-logger.service';
 import { DisbursementStatus, LoanStatus, RepaymentScheduleStatus } from '../../common/utils/constants/status.constants';
 import { RollbackService } from '../rollbacks/rollback.service'
 

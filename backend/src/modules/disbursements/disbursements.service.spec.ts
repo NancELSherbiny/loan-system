@@ -3,12 +3,15 @@ import {
   BadRequestException,
   ConflictException,
 } from '@nestjs/common';
-import { DisbursementsService } from './disbursements.service';
+import { DisbursementService } from './disbursements.service';
 import { PrismaService } from '../../../prisma/prisma.service';
-import { TransactionService } from '../../common/services/transaction.service';
+import { AuditService} from '../audit/audit.service';
+import { StructuredLoggerService } from '../../common/logging/structured-logger.service';
+import { RollbackService } from '../rollbacks/rollback.service';
+
 
 describe('DisbursementsService', () => {
-  let service: DisbursementsService;
+  let service: DisbursementService;
 
   const decimal = (value: number) => ({
     toString: () => value.toString(),
@@ -43,7 +46,7 @@ describe('DisbursementsService', () => {
   const mockPrismaService = {
     $transaction: jest.fn(),
   };
-  const mockTransactionService = {
+  const mockAuditService = {
     run: jest.fn(),
   };
 
@@ -54,56 +57,88 @@ describe('DisbursementsService', () => {
     currency: 'USD',
     tenor: 12,
     interestRate: 12,
-    disbursementDate: new Date('2025-01-01'),
-    firstPaymentDate: new Date('2025-02-01'),
+    disbursementDate: new Date('2025-01-01').toISOString(),
+    firstPaymentDate: new Date('2025-02-01').toISOString(),
   };
 
   beforeEach(async () => {
-    jest.resetAllMocks();
-    transactionClient = createTransactionClient();
+  jest.resetAllMocks();
+  transactionClient = createTransactionClient();
 
-    mockPrismaService.$transaction.mockImplementation((callback) =>
-      callback(transactionClient),
-    );
+  // Make $transaction call the callback with the mocked transaction client
+  mockPrismaService.$transaction.mockImplementation((callback) =>
+    // support async callback returning a Promise
+    Promise.resolve(callback(transactionClient)),
+  );
 
-    mockTransactionService.run.mockImplementation(
-      async (
-        transactionId,
-        operation,
-        userId,
-        metadata,
-        work,
-        options,
-      ) => {
-        if (options?.idempotency) {
-          const exists = await options.idempotency.check(transactionClient);
-          if (exists) {
-            if (options.idempotency.onDuplicate) {
-              await options.idempotency.onDuplicate();
-            }
-            throw new ConflictException('Duplicate transaction');
+  // Structured logger mock must include .log(...) because service calls structuredLogger.log(...)
+  const mockLogger = {
+    log: jest.fn(),
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+  };
+
+  // Rollback service mock must provide the methods used in the service (names must match)
+  const mockRollbackService = {
+    canRollbackDisbursementByLoan: jest.fn().mockResolvedValue(true),
+    compensateDisbursementByLoan: jest.fn().mockResolvedValue(undefined),
+    markDisbursementRolledBackByLoan: jest.fn().mockResolvedValue(undefined),
+    // keep record if other tests use it
+    record: jest.fn(),
+  };
+
+  // Audit service must execute the 'work' callback and handle idempotency options the service passes.
+  mockAuditService.run.mockImplementation(
+    async (
+      transactionId,
+      operation,
+      userId,
+      metadata,
+      work, // the function the service passes to run inside tx
+      options,
+    ) => {
+      // If idempotency option is provided, run the check against the transaction client
+      if (options?.idempotency) {
+        const exists = await options.idempotency.check(transactionClient);
+        if (exists) {
+          if (options.idempotency.onDuplicate) {
+            await options.idempotency.onDuplicate();
           }
+          // The service expects ConflictException to be thrown on duplicate
+          throw new ConflictException('Duplicate transaction');
         }
-        return work(transactionClient);
+      }
+      // If rollback options exist, we don't need to act now — the service passes them to audit wrapper.
+      // Execute the work with the mocked tx client and return whatever it returns.
+      return work(transactionClient);
+    },
+  );
+
+  const module: TestingModule = await Test.createTestingModule({
+    providers: [
+      DisbursementService,
+      {
+        provide: PrismaService,
+        useValue: mockPrismaService,
       },
-    );
+      {
+        provide: AuditService,
+        useValue: mockAuditService,
+      },
+      {
+        provide: StructuredLoggerService,
+        useValue: mockLogger,
+      },
+      {
+        provide: RollbackService,
+        useValue: mockRollbackService,
+      },
+    ],
+  }).compile();
 
-    const module: TestingModule = await Test.createTestingModule({
-      providers: [
-        DisbursementsService,
-        {
-          provide: PrismaService,
-          useValue: mockPrismaService,
-        },
-        {
-          provide: TransactionService,
-          useValue: mockTransactionService,
-        },
-      ],
-    }).compile();
-
-    service = module.get<DisbursementsService>(DisbursementsService);
-  });
+  service = module.get<DisbursementService>(DisbursementService);
+});
 
   const seedSuccessfulTransaction = () => {
     transactionClient.disbursement.findUnique.mockResolvedValue(null);
@@ -137,7 +172,8 @@ describe('DisbursementsService', () => {
       const result = await service.disburseLoan(baseDisbursementDto);
 
       expect(result.status).toBe('COMPLETED');
-      expect(mockTransactionService.run).toHaveBeenCalledTimes(1);
+      expect(mockAuditService
+    .run).toHaveBeenCalledTimes(1);
       expect(
         transactionClient.repaymentSchedule.createMany,
       ).toHaveBeenCalled();
